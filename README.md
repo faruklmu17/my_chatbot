@@ -12,10 +12,37 @@ You can ask questions like:
 ## 📦 Features
 
 - ✅ Automatically fetches a **Playwright test result JSON** file from a GitHub repo
-- ✅ Dynamically **trains a Naive Bayes model** on test data
+- ✅ Dynamically **trains a Naive Bayes model** on test data (via separate script)
 - ✅ Provides a **Gradio web UI** to chat with the test results
 - ✅ Re-trains itself when the test result file changes
 - ✅ Fully **offline-compatible**, no LLMs or OpenAI API needed
+
+---
+
+## 🚀 Getting Started (Step-by-Step)
+
+1. **Clone the Repo**
+   ```bash
+   git clone https://github.com/your-username/playwright-bot.git
+   cd playwright-bot
+   ```
+
+2. **Install Requirements**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. **Train the Model**
+   Run this to fetch the latest JSON from GitHub and train the model:
+   ```bash
+   python train_model.py
+   ```
+
+4. **Run the Chatbot**
+   Launch the Gradio chatbot UI:
+   ```bash
+   python app.py
+   ```
 
 ---
 
@@ -33,11 +60,14 @@ Each test case in the JSON is turned into question-answer pairs like:
 
 ### 3. **Trains a Naive Bayes Model**
 
-The model is trained on these Q&A pairs using `CountVectorizer` + `MultinomialNB` from `scikit-learn`.
+`train_model.py` trains the model and saves:
+- `model.pkl` (trained model)
+- `vectorizer.pkl` (text vectorizer)
+- `answers.pkl` (answer list)
 
 ### 4. **Gradio UI for Interaction**
 
-You can ask natural questions in a browser using the Gradio interface.
+`app.py` loads the saved model and answers to create a chatbot interface.
 
 ---
 
@@ -79,34 +109,26 @@ Use the GitHub Contents API with authentication and decode the base64 content.
 
 ---
 
-## 🚀 Hosting on Hugging Face Spaces
-
-This chatbot can be deployed for free using **[Hugging Face Spaces](https://huggingface.co/spaces)**.
-
-1. Create a new **Gradio Space**
-2. Upload:
-   - `app.py`
-   - `requirements.txt`
-   - `README.md`
-3. Done!
-
----
-
-## 📁 File Structure
+## 🧱 Project Structure
 
 ```
 .
-├── app.py                # Main Gradio chatbot app
-├── requirements.txt      # Python dependencies
-└── README.md             # This file
+├── app.py                # Gradio chatbot interface
+├── train_model.py        # Loads JSON & trains model
+├── model.pkl             # Trained model (generated)
+├── vectorizer.pkl        # Trained vectorizer (generated)
+├── answers.pkl           # Saved answer list (generated)
+├── requirements.txt      # Dependencies
+└── README.md             # Documentation
 ```
 
 ---
 
 ## 🛠 Dependencies
 
+Install everything in one line with:
 ```bash
-pip install gradio scikit-learn requests
+pip install -r requirements.txt
 ```
 
 ---

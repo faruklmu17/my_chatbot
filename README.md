@@ -113,7 +113,7 @@ pip install gradio scikit-learn requests
 
 ## 👨‍💻 Author
 
-Created by **Faruk Hasan**  
+Created by [**Faruk Hasan**](https://faruk-hasan.com/)  
 Senior QA Engineer | Coding Instructor | AI Explorer
 
 ---

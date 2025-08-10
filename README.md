@@ -1,3 +1,17 @@
+---
+title: Playwright Chatbot
+emoji: 🤖
+colorFrom: indigo
+colorTo: purple
+sdk: gradio
+app_file: app.py
+pinned: false
+license: mit
+tags:
+  - testing
+  - playwright
+  - qa
+---
 # 🤖 Playwright Test Bot – JSON Chatbot with Gradio
 
 This is a simple, lightweight **chatbot** built with **Python**, **Naive Bayes**, and **Gradio**, designed to answer questions about Playwright test results stored in a **JSON file**.

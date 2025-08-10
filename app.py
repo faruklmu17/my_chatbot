@@ -3,7 +3,7 @@ import re
 import gradio as gr
 import joblib
 import traceback
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 
 import train_model  # we reuse fetch_data() and iter_tests()
 
@@ -21,9 +21,7 @@ def load_artifacts():
     vectorizer = joblib.load(VECTORIZER_PATH)
     answers = joblib.load(ANSWERS_PATH)
 
-
 def get_snapshot():
-    """Pull the latest JSON (no retrain) and compute aggregates and lists, including flaky."""
     data = train_model.fetch_data()
     totals = {"passed": 0, "failed": 0, "skipped": 0, "flaky": 0, "unknown": 0}
     per_suite = {}
@@ -32,8 +30,6 @@ def get_snapshot():
     for suite_title, spec_title, test_title, final_status, project, is_flaky in train_model.iter_tests(data):
         name = test_title or spec_title or "Unnamed test"
         sname = suite_title or "Unknown suite"
-
-        # Treat flaky as its own status (does not double-count as passed)
         status = "flaky" if is_flaky else (final_status or "unknown").lower()
 
         totals[status] = totals.get(status, 0) + 1
@@ -49,14 +45,10 @@ def get_snapshot():
 
     return totals, per_suite, passed_tests, failed_tests, flaky_tests
 
-
 def handle_aggregate_intents(message: str) -> Optional[str]:
-    """Simple intent router for counts/lists (passed/failed/skipped/flaky). Returns a string or None."""
     msg = message.lower().strip()
-
     totals, per_suite, passed_tests, failed_tests, flaky_tests = get_snapshot()
 
-    # "any flaky tests?" -> yes/no + count
     if re.search(r"\b(any\s+)?flaky tests?\b|\bflaky\?\b", msg):
         if totals.get("flaky", 0) == 0:
             return "No flaky tests."
@@ -64,21 +56,15 @@ def handle_aggregate_intents(message: str) -> Optional[str]:
         more = "" if len(flaky_tests) <= 50 else f"\n… and {len(flaky_tests)-50} more."
         return f"{totals['flaky']} flaky tests:\n{items}{more}"
 
-    # how many passed/failed/skipped/flaky
     m = re.search(r"(how many|count|number of)\s+(tests?\s+)?(passed|failed|skipped|flaky)", msg)
     if m:
         what = m.group(3)
         return f"{totals.get(what,0)} tests {what}."
 
-    # total tests
     if re.search(r"(how many|count|number of)\s+(tests?)\b", msg):
         total = sum(totals.values())
-        return (
-            f"Total tests: {total} (passed {totals['passed']}, failed {totals['failed']}, "
-            f"skipped {totals['skipped']}, flaky {totals['flaky']})."
-        )
+        return f"Total tests: {total} (passed {totals['passed']}, failed {totals['failed']}, skipped {totals['skipped']}, flaky {totals['flaky']})."
 
-    # list failed / passed / flaky
     if re.search(r"\b(list|show|which)\b.*\b(failed tests|tests that failed|failures)\b", msg):
         if not failed_tests:
             return "No failed tests."
@@ -100,7 +86,6 @@ def handle_aggregate_intents(message: str) -> Optional[str]:
         more = "" if len(flaky_tests) <= 50 else f"\n… and {len(flaky_tests)-50} more."
         return f"Flaky tests:\n{items}{more}"
 
-    # per-suite example: "how many flaky in checkout"
     m = re.search(r"(how many|count|number of)\s+(tests?\s+)?(passed|failed|skipped|flaky)\s+in\s+(.+)", msg)
     if m:
         what = m.group(3)
@@ -113,15 +98,12 @@ def handle_aggregate_intents(message: str) -> Optional[str]:
 
     return None
 
-
-# === Chat (type="messages") helpers ===
-Message = Dict[str, str]  # {"role": "user"|"assistant", "content": str}
+Message = Dict[str, str]
 
 def _append_exchange(history: Optional[List[Message]], user_msg: str, assistant_msg: str) -> List[Message]:
     history = history or []
     history = history + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": assistant_msg}]
     return history
-
 
 def respond(user_text: str, history_msgs: Optional[List[Message]]):
     """Gradio callback that takes user text + Chatbot messages and returns updated messages.
@@ -134,22 +116,17 @@ def respond(user_text: str, history_msgs: Optional[List[Message]]):
     def _short_help() -> str:
         totals, *_ = get_snapshot()
         total = sum(totals.values())
-        return (
-            "Here’s the current snapshot:
-"
-            f"• Total: {total}
-"
-            f"• Passed: {totals['passed']}
-"
-            f"• Failed: {totals['failed']}
-"
-            f"• Skipped: {totals['skipped']}
-"
-            f"• Flaky: {totals['flaky']}
-
-"
-            "Try: 'list failed tests', 'any flaky tests?', or 'how many passed in <suite>'."
-        )
+        lines = [
+            "Here’s the current snapshot:",
+            f"• Total: {total}",
+            f"• Passed: {totals['passed']}",
+            f"• Failed: {totals['failed']}",
+            f"• Skipped: {totals['skipped']}",
+            f"• Flaky: {totals['flaky']}",
+            "",
+            "Try: 'list failed tests', 'any flaky tests?', or 'how many passed in <suite>'.",
+        ]
+        return "\n".join(lines)
 
     # 1) If too vague like just 'tests' or 'results', show summary to avoid hallucinated per-test answers
     if re.fullmatch(r"(?i)(tests?|results?)\??", text):
@@ -168,9 +145,10 @@ def respond(user_text: str, history_msgs: Optional[List[Message]]):
 
     # 3) Fallback: ML classifier for per-test Q&A, with a confidence guardrail
     try:
+        if model is None or vectorizer is None or answers is None:
+            raise RuntimeError("Artifacts not loaded")
         X = vectorizer.transform([text])
-        reply = None
-        conf = None
+        reply: Optional[str] = None
         if hasattr(model, "predict_proba"):
             proba = model.predict_proba(X)[0]
             idx = int(proba.argmax())
@@ -183,23 +161,6 @@ def respond(user_text: str, history_msgs: Optional[List[Message]]):
             pred = model.predict(X)[0]
             reply = answers[pred]
     except Exception as e:
-        reply = f"Error answering your question:
-{e}
-
-{traceback.format_exc()}"
-
-    updated = _append_exchange(history_msgs, user_text, reply)
-    return updated, gr.update(value="")
-    except Exception:
-        # don't break chat if aggregate fails
-        pass
-
-    # Fallback: ML classifier for per-test Q&A
-    try:
-        X = vectorizer.transform([user_text])
-        pred = model.predict(X)[0]
-        reply = answers[pred]
-    except Exception as e:
         reply = f"Error answering your question:\n{e}\n\n{traceback.format_exc()}"
 
     updated = _append_exchange(history_msgs, user_text, reply)
@@ -207,7 +168,6 @@ def respond(user_text: str, history_msgs: Optional[List[Message]]):
 
 
 def do_refresh():
-    """Retrain from latest GitHub JSON and hot-reload the model."""
     try:
         train_model.train_bot()
         load_artifacts()
@@ -215,8 +175,6 @@ def do_refresh():
     except Exception as e:
         return f"❌ Refresh failed: {e}"
 
-
-# Init
 load_artifacts()
 
 with gr.Blocks(title="Playwright Test Bot") as demo:
@@ -225,7 +183,6 @@ with gr.Blocks(title="Playwright Test Bot") as demo:
         refresh_btn = gr.Button("🔄 Refresh from GitHub & Retrain")
         refresh_status = gr.Markdown("")
 
-    # IMPORTANT: type="messages" ensures the Chatbot stores messages as {role, content}
     chat = gr.Chatbot(type="messages", height=420)
     msg = gr.Textbox(placeholder="Try: How many tests passed?")
     send = gr.Button("Send", variant="primary")

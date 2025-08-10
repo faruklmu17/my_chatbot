@@ -128,12 +128,68 @@ def respond(user_text: str, history_msgs: Optional[List[Message]]):
 
     With Chatbot(type="messages"), `history_msgs` is a list of {role, content} dicts.
     """
-    # Try aggregate intents first
+    text = (user_text or "").strip()
+
+    # Helper to provide a concise snapshot/help when the query is vague
+    def _short_help() -> str:
+        totals, *_ = get_snapshot()
+        total = sum(totals.values())
+        return (
+            "Here’s the current snapshot:
+"
+            f"• Total: {total}
+"
+            f"• Passed: {totals['passed']}
+"
+            f"• Failed: {totals['failed']}
+"
+            f"• Skipped: {totals['skipped']}
+"
+            f"• Flaky: {totals['flaky']}
+
+"
+            "Try: 'list failed tests', 'any flaky tests?', or 'how many passed in <suite>'."
+        )
+
+    # 1) If too vague like just 'tests' or 'results', show summary to avoid hallucinated per-test answers
+    if re.fullmatch(r"(?i)(tests?|results?)\??", text):
+        updated = _append_exchange(history_msgs, user_text, _short_help())
+        return updated, gr.update(value="")
+
+    # 2) Aggregate intents (counts/lists/suites)
     try:
-        agg = handle_aggregate_intents(user_text)
+        agg = handle_aggregate_intents(text)
         if agg is not None:
             updated = _append_exchange(history_msgs, user_text, agg)
             return updated, gr.update(value="")
+    except Exception:
+        # don't break chat if aggregate fails
+        pass
+
+    # 3) Fallback: ML classifier for per-test Q&A, with a confidence guardrail
+    try:
+        X = vectorizer.transform([text])
+        reply = None
+        conf = None
+        if hasattr(model, "predict_proba"):
+            proba = model.predict_proba(X)[0]
+            idx = int(proba.argmax())
+            conf = float(proba[idx])
+            pred = model.classes_[idx]
+            reply = answers[pred]
+            if conf < 0.45:
+                reply = _short_help()
+        else:
+            pred = model.predict(X)[0]
+            reply = answers[pred]
+    except Exception as e:
+        reply = f"Error answering your question:
+{e}
+
+{traceback.format_exc()}"
+
+    updated = _append_exchange(history_msgs, user_text, reply)
+    return updated, gr.update(value="")
     except Exception:
         # don't break chat if aggregate fails
         pass

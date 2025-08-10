@@ -3,6 +3,7 @@ import re
 import gradio as gr
 import joblib
 import traceback
+from typing import List, Dict, Optional, Tuple
 
 import train_model  # we reuse fetch_data() and iter_tests()
 
@@ -20,6 +21,7 @@ def load_artifacts():
     vectorizer = joblib.load(VECTORIZER_PATH)
     answers = joblib.load(ANSWERS_PATH)
 
+
 def get_snapshot():
     """Pull the latest JSON (no retrain) and compute aggregates and lists, including flaky."""
     data = train_model.fetch_data()
@@ -35,7 +37,7 @@ def get_snapshot():
         status = "flaky" if is_flaky else (final_status or "unknown").lower()
 
         totals[status] = totals.get(status, 0) + 1
-        per_suite.setdefault(sname, {"passed":0,"failed":0,"skipped":0,"flaky":0,"unknown":0})
+        per_suite.setdefault(sname, {"passed": 0, "failed": 0, "skipped": 0, "flaky": 0, "unknown": 0})
         per_suite[sname][status] = per_suite[sname].get(status, 0) + 1
 
         if status == "passed":
@@ -48,9 +50,8 @@ def get_snapshot():
     return totals, per_suite, passed_tests, failed_tests, flaky_tests
 
 
-def handle_aggregate_intents(message: str):
+def handle_aggregate_intents(message: str) -> Optional[str]:
     """Simple intent router for counts/lists (passed/failed/skipped/flaky). Returns a string or None."""
-    import re
     msg = message.lower().strip()
 
     totals, per_suite, passed_tests, failed_tests, flaky_tests = get_snapshot()
@@ -72,7 +73,10 @@ def handle_aggregate_intents(message: str):
     # total tests
     if re.search(r"(how many|count|number of)\s+(tests?)\b", msg):
         total = sum(totals.values())
-        return f"Total tests: {total} (passed {totals['passed']}, failed {totals['failed']}, skipped {totals['skipped']}, flaky {totals['flaky']})."
+        return (
+            f"Total tests: {total} (passed {totals['passed']}, failed {totals['failed']}, "
+            f"skipped {totals['skipped']}, flaky {totals['flaky']})."
+        )
 
     # list failed / passed / flaky
     if re.search(r"\b(list|show|which)\b.*\b(failed tests|tests that failed|failures)\b", msg):
@@ -110,27 +114,41 @@ def handle_aggregate_intents(message: str):
     return None
 
 
-def respond(message, history):
-    # First: try aggregate intents
+# === Chat (type="messages") helpers ===
+Message = Dict[str, str]  # {"role": "user"|"assistant", "content": str}
+
+def _append_exchange(history: Optional[List[Message]], user_msg: str, assistant_msg: str) -> List[Message]:
+    history = history or []
+    history = history + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": assistant_msg}]
+    return history
+
+
+def respond(user_text: str, history_msgs: Optional[List[Message]]):
+    """Gradio callback that takes user text + Chatbot messages and returns updated messages.
+
+    With Chatbot(type="messages"), `history_msgs` is a list of {role, content} dicts.
+    """
+    # Try aggregate intents first
     try:
-        agg = handle_aggregate_intents(message)
+        agg = handle_aggregate_intents(user_text)
         if agg is not None:
-            history = history + [(message, agg)]
-            return history, gr.update(value="")
-    except Exception as e:
-        # don’t break chat if aggregate fails
+            updated = _append_exchange(history_msgs, user_text, agg)
+            return updated, gr.update(value="")
+    except Exception:
+        # don't break chat if aggregate fails
         pass
 
     # Fallback: ML classifier for per-test Q&A
     try:
-        X = vectorizer.transform([message])
+        X = vectorizer.transform([user_text])
         pred = model.predict(X)[0]
         reply = answers[pred]
     except Exception as e:
         reply = f"Error answering your question:\n{e}\n\n{traceback.format_exc()}"
 
-    history = history + [(message, reply)]
-    return history, gr.update(value="")
+    updated = _append_exchange(history_msgs, user_text, reply)
+    return updated, gr.update(value="")
+
 
 def do_refresh():
     """Retrain from latest GitHub JSON and hot-reload the model."""
@@ -141,6 +159,7 @@ def do_refresh():
     except Exception as e:
         return f"❌ Refresh failed: {e}"
 
+
 # Init
 load_artifacts()
 
@@ -149,7 +168,9 @@ with gr.Blocks(title="Playwright Test Bot") as demo:
     with gr.Row():
         refresh_btn = gr.Button("🔄 Refresh from GitHub & Retrain")
         refresh_status = gr.Markdown("")
-    chat = gr.Chatbot(height=420)
+
+    # IMPORTANT: type="messages" ensures the Chatbot stores messages as {role, content}
+    chat = gr.Chatbot(type="messages", height=420)
     msg = gr.Textbox(placeholder="Try: How many tests passed?")
     send = gr.Button("Send", variant="primary")
 

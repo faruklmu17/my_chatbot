@@ -188,6 +188,6 @@ def train_bot():
     joblib.dump(vectorizer, "vectorizer.pkl")
     joblib.dump(answers, "answers.pkl")
     print("✅ Model trained and saved successfully.")
-
+#new
 if __name__ == "__main__":
     train_bot()

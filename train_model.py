@@ -18,7 +18,7 @@ def fetch_data() -> Dict[str, Any]:
         return resp.json()
     raise RuntimeError(f"Failed to fetch JSON. Status code: {resp.status_code}")
 
-# ---------------- Core test iteration (kept compatible with your earlier code) ----------------
+# ---------------- Core test iteration (compatible with earlier code) ----------------
 
 def iter_tests(data) -> Iterator[Tuple[str, str, str, str, Optional[str], bool]]:
     """
@@ -90,7 +90,6 @@ def _parse_ts(value: Any) -> Optional[datetime]:
 def _best_result_time(result: Dict[str, Any]) -> Optional[datetime]:
     """
     Pick the most reliable time field from a single result object.
-    Common fields seen in the wild.
     """
     for key in ("startTime", "startTimeEpoch", "startTimeUnix", "startTimeMs", "startTimeMS", "startTimeMilliseconds"):
         dt = _parse_ts(result.get(key))

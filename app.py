@@ -1,8 +1,9 @@
 # app.py
+import os
 import re
 import joblib
 import traceback
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 
 from datetime import datetime
 from zoneinfo import ZoneInfo  # Python 3.9+
@@ -18,8 +19,8 @@ LOCAL_TZ = ZoneInfo("America/New_York")
 # Import your data helpers
 import train_model  # uses fetch_data(), iter_tests_with_time(), iter_tests()
 
-# If you want to quickly preview with a tiny UI, flip this to True.
-ENABLE_MINIMAL_UI = False
+# Auto-enable a tiny Gradio UI on Hugging Face Spaces (keeps local behavior unchanged)
+ENABLE_MINIMAL_UI = bool(os.getenv("SPACE_ID")) or os.getenv("ENABLE_MINIMAL_UI") == "1"
 
 # ---------------- Model/answers ----------------
 
@@ -130,7 +131,7 @@ def respond(user_text: str) -> str:
     except Exception as e:
         return f"Error: {e}\n{traceback.format_exc()}"
 
-# ---------------- Minimal optional UI (off by default) ----------------
+# ---------------- Minimal optional UI (auto-enabled on HF Spaces) ----------------
 
 if __name__ == "__main__":
     load_artifacts()
@@ -150,8 +151,8 @@ if __name__ == "__main__":
             btn.click(_on_click, inputs=[chat_in], outputs=[chat_out])
             chat_in.submit(_on_click, inputs=[chat_in], outputs=[chat_out])
 
+        # On HF, Gradio will bind to the port it detects (SPACE settings). Locally, default port.
         demo.launch()
     else:
-        # No UI here — this keeps your existing UI untouched.
-        # Import this module and wire `respond()` into your current Gradio layout.
-        print("Artifacts loaded. Using existing UI. (Set ENABLE_MINIMAL_UI=True to preview.)")
+        # No UI here — this keeps your existing UI untouched (import respond() elsewhere).
+        print("Artifacts loaded. Using existing UI. (Set ENABLE_MINIMAL_UI=1 or run on HF Spaces to launch demo.)")

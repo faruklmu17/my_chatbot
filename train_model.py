@@ -1,150 +1,193 @@
 # train_model.py
 import requests
-import json
 import joblib
-from datetime import datetime, timezone
-from typing import Iterator, Tuple, Optional, Any, Dict
-
+from typing import Dict, Any, List, Tuple, Iterator
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.feature_extraction.text import CountVectorizer
 
 # ✅ Default GitHub raw link for testing
 GITHUB_JSON_URL = "https://raw.githubusercontent.com/faruklmu17/browser_extension_test/refs/heads/main/tests/test-results.json"
 
+# ---- Status normalization ----
+FAIL_STATUSES = {"failed", "timedout", "timed_out", "interrupted"}
+PASS_STATUSES = {"passed"}
+SKIP_STATUSES = {"skipped"}
+
+def _status_str(s: str) -> str:
+    if not s:
+        return "unknown"
+    s = s.strip().lower().replace(" ", "").replace("-", "").replace("_", "")
+    # map common variants
+    if s in {"timedout", "timeout", "timedouterror"}:
+        return "timedout"
+    if s in {"pass", "ok", "success"}:
+        return "passed"
+    if s in {"skip", "skipping"}:
+        return "skipped"
+    if s in {"fail", "error"}:
+        return "failed"
+    return s
+
+# ---- JSON walkers that are defensive about schema ----
+def _attempts_from_test(test: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Extract attempts from a test object across common Playwright reporter shapes.
+    Returns a list of {status, duration_ms, errors}.
+    """
+    attempts: List[Dict[str, Any]] = []
+
+    for key in ("retries", "attempts", "results"):
+        arr = test.get(key)
+        if isinstance(arr, list) and arr:
+            for a in arr:
+                status = _status_str(a.get("status") or a.get("outcome") or test.get("status") or "")
+                attempts.append({
+                    "status": status,
+                    "duration_ms": a.get("duration") or a.get("durationMs"),
+                    "errors": a.get("errors") or a.get("error") or [],
+                })
+            break
+
+    if not attempts:
+        status = _status_str(test.get("status") or test.get("outcome") or "")
+        attempts.append({
+            "status": status or "unknown",
+            "duration_ms": test.get("duration") or test.get("durationMs"),
+            "errors": test.get("errors") or test.get("error") or [],
+        })
+
+    # Fill unknowns defensively
+    for a in attempts:
+        if not a["status"]:
+            a["status"] = "unknown"
+    return attempts
+
+def _walk_playwright(data: Dict[str, Any]):
+    """
+    Yields (suite_title, spec_title, test_obj) for each test in the report.
+    Supports nested suites/specs and alternate 'results' layout.
+    """
+    def _iter_suite(suite: Dict[str, Any]):
+        suite_title = suite.get("title") or suite.get("name") or suite.get("file") or ""
+        # specs with tests
+        for spec in suite.get("specs", []):
+            spec_title = spec.get("title") or spec.get("file") or ""
+            for test in spec.get("tests", []):
+                yield suite_title, spec_title, test
+        # tests directly under suite
+        for test in suite.get("tests", []):
+            yield suite_title, suite_title, test
+        # nested
+        for child in suite.get("suites", []):
+            yield from _iter_suite(child)
+
+    if isinstance(data.get("suites"), list):
+        for suite in data["suites"]:
+            yield from _iter_suite(suite)
+        return
+
+    # Fallback reporters
+    for r in data.get("results", []):
+        suite_title = (r.get("suite") or {}).get("title") or (r.get("suite") or {}).get("name") or ""
+        spec_title = r.get("file") or r.get("title") or ""
+        for test in r.get("tests", []):
+            yield suite_title, spec_title, test
+
+def _guess_project(test: Dict[str, Any]) -> str:
+    return test.get("projectName") or test.get("project") or test.get("projectId") or "default"
+
+def _normalize_tests(data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """
+    Build a dict keyed by a stable composite id with rich info per test.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for suite_title, spec_title, test in _walk_playwright(data):
+        title = test.get("title") or ""
+        project = _guess_project(test)
+        attempts = _attempts_from_test(test)
+        final_status = attempts[-1]["status"] if attempts else "unknown"
+        failed_once = any(a["status"] in FAIL_STATUSES for a in attempts)
+        is_flaky = failed_once and (final_status in PASS_STATUSES)
+
+        test_id = test.get("id") or f"{suite_title}::{spec_title}::{title}::{project}"
+        out[test_id] = {
+            "suite": suite_title or "Unknown suite",
+            "spec": spec_title or "Unknown spec",
+            "title": title or "Unknown test",
+            "project": project,
+            "attempts": attempts,
+            "final_status": final_status,
+            "failed_once": failed_once,
+            "is_flaky": is_flaky,
+        }
+    return out
+
+# ---- Public API used by app.py ----
 def fetch_data() -> Dict[str, Any]:
-    """Fetch the Playwright JSON from GitHub (or your endpoint)."""
+    """Fetches JSON data from the GitHub raw URL."""
     resp = requests.get(GITHUB_JSON_URL, timeout=20)
     if resp.status_code == 200:
         return resp.json()
     raise RuntimeError(f"Failed to fetch JSON. Status code: {resp.status_code}")
 
-# ---------------- Core test iteration (compatible with earlier code) ----------------
-
-def iter_tests(data) -> Iterator[Tuple[str, str, str, str, Optional[str], bool]]:
+def iter_tests_with_attempts(data: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     """
-    Yield (suite_title, spec_title, test_title, final_status, project_name, was_flaky)
-    Supports:
-      - suites -> specs -> tests -> results (newer Playwright JSON)
-      - suites -> tests -> results (flat inside suite)
+    Yields rich dicts for each test:
+      {suite, spec, title, project, attempts, final_status, failed_once, is_flaky}
     """
-    for suite in data.get("suites", []):
-        suite_title = suite.get("title") or ""
-        # pattern A: specs -> tests
-        for spec in suite.get("specs", []):
-            spec_title = spec.get("title") or spec.get("file") or ""
-            for test in spec.get("tests", []):
-                final_status, project, flaky = _final_status_project_flaky(test)
-                yield (suite_title, spec_title, test.get("title", ""), final_status, project, flaky)
+    normalized = _normalize_tests(data)
+    return iter(normalized.values())
 
-        # pattern B: tests directly under suite
-        for test in suite.get("tests", []):
-            final_status, project, flaky = _final_status_project_flaky(test)
-            yield (suite_title, "", test.get("title", ""), final_status, project, flaky)
-
-def _final_status_project_flaky(test: Dict[str, Any]) -> Tuple[str, Optional[str], bool]:
-    """Return final status (last retry), projectName, flaky."""
-    results = test.get("results") or []
-    if not results:
-        return ("unknown", test.get("projectName"), bool(test.get("flaky")))
-    last = results[-1]
-    status = last.get("status", "unknown")
-    flaky = bool(last.get("flaky") or test.get("flaky"))
-    project = test.get("projectName") or last.get("projectName")
-    return (status, project, flaky)
-
-# ---------------- Time parsing utilities (NEW) ----------------
-
-def _parse_ts(value: Any) -> Optional[datetime]:
+def iter_tests(data: Dict[str, Any]):
     """
-    Robust timestamp parser -> timezone-aware UTC datetime.
-    Accepts:
-      - ISO8601 strings, with or without Z
-      - epoch seconds or milliseconds (int/float/str)
+    Backward‑compatible iterator used by older app.py versions.
+    Yields: (suite_title, spec_title, test_title, final_status, project_name, was_flaky)
     """
-    if value is None:
-        return None
+    for t in iter_tests_with_attempts(data):
+        yield (
+            t["suite"],
+            t["spec"],
+            t["title"],
+            t["final_status"],
+            t["project"],
+            t["is_flaky"],
+        )
 
-    # epoch number or numeric string
-    try:
-        if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip().replace(".", "", 1).isdigit()):
-            v = float(value)
-            if v > 1e12:  # likely milliseconds -> seconds
-                v /= 1000.0
-            return datetime.fromtimestamp(v, tz=timezone.utc)
-    except Exception:
-        pass
+# ---- Naive Bayes trainer (unchanged interface, better text) ----
+def train_bot():
+    """Fetch Playwright JSON, generate Q&A pairs, train Naive Bayes, and save artifacts."""
+    data = fetch_data()
+    questions: List[str] = []
+    answers: List[str] = []
 
-    # ISO8601
-    if isinstance(value, str):
-        s = value.strip()
-        if s.endswith("Z"):
-            s = s.replace("Z", "+00:00")
-        try:
-            dt = datetime.fromisoformat(s)
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-        except Exception:
-            return None
+    for suite_title, spec_title, test_title, final_status, project, _ in iter_tests(data):
+        fs = _status_str(final_status)
+        # Q/A per test
+        questions.append(f"What was the result of '{test_title}'?")
+        answers.append(f"The test '{test_title}' in '{suite_title}' {fs}.")
 
-    return None
+        # Project variant
+        questions.append(f"Did '{test_title}' pass on {project}?")
+        answers.append("Yes, it passed." if fs in PASS_STATUSES else "No, it did not pass.")
 
-def _best_result_time(result: Dict[str, Any]) -> Optional[datetime]:
-    """
-    Pick the most reliable time field from a single result object.
-    """
-    for key in ("startTime", "startTimeEpoch", "startTimeUnix", "startTimeMs", "startTimeMS", "startTimeMilliseconds"):
-        dt = _parse_ts(result.get(key))
-        if dt:
-            return dt
-    return None
+        # Fail variant
+        questions.append(f"Did '{test_title}' fail?")
+        answers.append("Yes, it failed." if fs in FAIL_STATUSES else "No, it did not fail.")
 
-def _extract_last_attempt_time(test: Dict[str, Any]) -> Optional[datetime]:
-    """
-    For a test with retries, take the LAST result's start time.
-    If not found on results, try test-level time fields as a fallback.
-    """
-    results = test.get("results") or []
-    if results:
-        dt = _best_result_time(results[-1])
-        if dt:
-            return dt
+    if not questions:
+        raise ValueError("No questions generated. The JSON structure may be unexpected. Inspect the file shape.")
 
-    for key in ("startTime", "startTimeEpoch", "startTimeUnix", "startTimeMs", "startTimeMS"):
-        dt = _parse_ts(test.get(key))
-        if dt:
-            return dt
+    vectorizer = CountVectorizer()
+    X = vectorizer.fit_transform(questions)
+    y = list(range(len(answers)))
 
-    return None
+    model = MultinomialNB()
+    model.fit(X, y)
 
-def iter_tests_with_time(data) -> Iterator[Tuple[str, str, str, str, Optional[str], bool, Optional[datetime]]]:
-    """
-    Yield (suite_title, spec_title, test_title, final_status, project_name, was_flaky, start_time_utc)
-    start_time_utc is the start time of the LAST RETRY (final attempt), tz-aware UTC.
-    """
-    for suite in data.get("suites", []):
-        suite_title = suite.get("title") or ""
-        # pattern A
-        for spec in suite.get("specs", []):
-            spec_title = spec.get("title") or spec.get("file") or ""
-            for test in spec.get("tests", []):
-                final_status, project, flaky = _final_status_project_flaky(test)
-                yield (
-                    suite_title,
-                    spec_title,
-                    test.get("title", ""),
-                    final_status,
-                    project,
-                    flaky,
-                    _extract_last_attempt_time(test),
-                )
-        # pattern B
-        for test in suite.get("tests", []):
-            final_status, project, flaky = _final_status_project_flaky(test)
-            yield (
-                suite_title,
-                "",
-                test.get("title", ""),
-                final_status,
-                project,
-                flaky,
-                _extract_last_attempt_time(test),
-            )
+    joblib.dump(model, "model.pkl")
+    joblib.dump(vectorizer, "vectorizer.pkl")
+    joblib.dump(answers, "answers.pkl")
+    print("✅ Model trained and saved successfully.")
+
+if __name__ == "__main__":
+    train_bot()

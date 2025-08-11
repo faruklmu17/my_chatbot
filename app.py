@@ -1,158 +1,270 @@
 # app.py
-import os
 import re
+import gradio as gr
 import joblib
 import traceback
-from typing import Optional, Dict
+from typing import List, Dict, Optional, Any
 
-from datetime import datetime
-from zoneinfo import ZoneInfo  # Python 3.9+
+import train_model  # we reuse fetch_data() and iter_tests()/iter_tests_with_attempts()
 
-# Your model artifacts
 MODEL_PATH = "model.pkl"
 VECTORIZER_PATH = "vectorizer.pkl"
 ANSWERS_PATH = "answers.pkl"
 
-# Timezone for human-friendly timestamps
-LOCAL_TZ = ZoneInfo("America/New_York")
-
-# Import your data helpers
-import train_model  # uses fetch_data(), iter_tests_with_time(), iter_tests()
-
-# Auto-enable a tiny Gradio UI on Hugging Face Spaces (keeps local behavior unchanged)
-ENABLE_MINIMAL_UI = bool(os.getenv("SPACE_ID")) or os.getenv("ENABLE_MINIMAL_UI") == "1"
-
-# ---------------- Model/answers ----------------
-
 model = None
 vectorizer = None
-answers: Dict[str, str] = {}
+answers = None
 
+# ---- Normalization helpers ----
+PASS = {"passed"}
+SKIP = {"skipped"}
+FAIL = {"failed", "timedout", "timed_out", "interrupted"}
+KNOWN = PASS | SKIP | FAIL | {"unknown"}
+
+def _norm_status(s: Optional[str]) -> str:
+    if not s:
+        return "unknown"
+    s = s.strip().lower().replace(" ", "").replace("-", "_")
+    return s if s in KNOWN else s  # keep raw if reporter uses something custom
+
+def _safe(s: Optional[str], default: str) -> str:
+    return (s or "").strip() or default
+
+# ---- Load artifacts (unchanged) ----
 def load_artifacts():
-    """Load NB model, vectorizer, and canned answers."""
     global model, vectorizer, answers
     model = joblib.load(MODEL_PATH)
     vectorizer = joblib.load(VECTORIZER_PATH)
     answers = joblib.load(ANSWERS_PATH)
 
-# ---------------- Helpers: last-run + greetings ----------------
-
-def get_last_run_info() -> str:
-    """Find the most recent test attempt start time and format it nicely."""
+# ---- Snapshot that understands retries/attempts ----
+def get_snapshot():
+    """
+    Returns:
+      totals: dict
+      per_suite: dict
+      passed_tests: [str]
+      failed_tests: [str]                  # FINAL failures only
+      flaky_tests: [str]                   # failed then passed
+      failed_at_least_once_names: [str]    # failed in any attempt (incl. flaky + final fails)
+    """
     data = train_model.fetch_data()
-    latest = None
-    sample_name = None
-    sample_project = None
 
-    for _suite, _spec, test_title, _status, project, _flaky, start_dt in train_model.iter_tests_with_time(data):
-        if not start_dt:
-            continue
-        if (latest is None) or (start_dt > latest):
-            latest = start_dt
-            sample_name = test_title
-            sample_project = project
+    # Prefer richer iterator with attempts; fallback to your old one
+    use_rich = hasattr(train_model, "iter_tests_with_attempts")
+    tests: List[Dict[str, Any]] = []
 
-    if not latest:
-        return "I couldn't find a timestamp for the last run."
+    if use_rich:
+        # each t is a dict with suite/spec/title/project/attempts/final_status/is_flaky/failed_once
+        tests = list(train_model.iter_tests_with_attempts(data))
+    else:
+        # Backward compat using your existing tuple iterator
+        # (suite_title, spec_title, test_title, final_status, project, is_flaky)
+        for suite_title, spec_title, test_title, final_status, project, is_flaky in train_model.iter_tests(data):
+            tests.append({
+                "suite": suite_title,
+                "spec": spec_title,
+                "title": test_title,
+                "project": project,
+                "attempts": [{"status": _norm_status(final_status)}],  # single attempt proxy
+                "final_status": _norm_status(final_status),
+                "is_flaky": bool(is_flaky),
+                # without attempts we can't truly know, so approximate:
+                "failed_once": _norm_status(final_status) in FAIL or bool(is_flaky),
+            })
 
-    local_dt = latest.astimezone(LOCAL_TZ)
-    # latest is tz-aware UTC datetime from iter_tests_with_time
-    return (
-        f"Last test attempt started on {local_dt.strftime('%Y-%m-%d %I:%M:%S %p %Z')} "
-        f"(~{latest.strftime('%Y-%m-%d %H:%M:%S')} UTC)"
-        + (f" — example test: “{sample_name}”" if sample_name else "")
-        + (f" (project: {sample_project})" if sample_project else "")
-        + "."
-    )
+    totals = {"passed": 0, "failed": 0, "skipped": 0, "flaky": 0, "unknown": 0}
+    per_suite: Dict[str, Dict[str, int]] = {}
+    passed_tests, failed_tests, flaky_tests = [], [], []
+    failed_at_least_once_names = []
 
-def is_greeting(text: str) -> bool:
-    """Lightweight greeting detector (hi/hello/gm/hey/how are you, etc.)."""
-    patterns = [
-        r"^\s*hi\b",
-        r"^\s*hello\b",
-        r"^\s*hey\b",
-        r"\bgood\s*(morning|afternoon|evening)\b",
-        r"\bhow\s*are\s*you\b",
-        r"\bhow\s*r\s*you\b",
-        r"\bgm\b", r"\bgn\b", r"\bge\b",
-    ]
-    t = (text or "").strip().lower()
-    return any(re.search(p, t, re.I) for p in patterns)
+    for t in tests:
+        name = _safe(t.get("title") or t.get("spec"), "Unnamed test")
+        sname = _safe(t.get("suite"), "Unknown suite")
+        proj = _safe(t.get("project"), "default")
 
-# ---------------- Intent classification + response ----------------
+        # Determine final status defensively
+        final_status = _norm_status(t.get("final_status"))
+        if not final_status:
+            attempts = t.get("attempts") or []
+            final_status = _norm_status((attempts[-1].get("status") if attempts else None))
 
-def respond(user_text: str) -> str:
+        is_flaky = bool(t.get("is_flaky"))
+        failed_once = bool(t.get("failed_once"))
+
+        # Tally totals/per_suite using final status (Playwright semantics)
+        key = "flaky" if is_flaky else (final_status or "unknown")
+        totals[key] = totals.get(key, 0) + 1
+        per_suite.setdefault(sname, {"passed": 0, "failed": 0, "skipped": 0, "flaky": 0, "unknown": 0})
+        per_suite[sname][key] = per_suite[sname].get(key, 0) + 1
+
+        # Named lists (keep your existing strings)
+        label = f"{name} ({sname})"
+        if is_flaky:
+            flaky_tests.append(label)
+        if final_status in PASS:
+            passed_tests.append(label)
+        elif final_status in FAIL:
+            failed_tests.append(label)
+
+        if failed_once:
+            failed_at_least_once_names.append(label)
+
+    return totals, per_suite, passed_tests, failed_tests, flaky_tests, failed_at_least_once_names
+
+# ---- Aggregate intents (extended) ----
+def handle_aggregate_intents(message: str) -> Optional[str]:
+    msg = message.lower().strip()
+    totals, per_suite, passed_tests, failed_tests, flaky_tests, failed_once_names = get_snapshot()
+
+    # Any flaky?
+    if re.search(r"\b(any\s+)?flaky tests?\b|\bflaky\?\b", msg):
+        if totals.get("flaky", 0) == 0:
+            return "No flaky tests."
+        items = "\n".join(f"- {t}" for t in flaky_tests[:50])
+        more = "" if len(flaky_tests) <= 50 else f"\n… and {len(flaky_tests)-50} more."
+        return f"{totals['flaky']} flaky tests:\n{items}{more}"
+
+    # Counts (passed/failed/skipped/flaky)
+    m = re.search(r"(how many|count|number of)\s+(tests?\s+)?(passed|failed|skipped|flaky)\b", msg)
+    if m:
+        what = m.group(3)
+        return f"{totals.get(what,0)} tests {what}."
+
+    # Total tests
+    if re.search(r"(how many|count|number of)\s+(tests?)\b", msg):
+        total = sum(totals.values())
+        return f"Total tests: {total} (passed {totals['passed']}, failed {totals['failed']}, skipped {totals['skipped']}, flaky {totals['flaky']})."
+
+    # List FINAL failed tests
+    if re.search(r"\b(list|show|which)\b.*\b(failed tests|tests that failed|failures)\b", msg):
+        if not failed_tests:
+            return "No failed tests (final results)."
+        items = "\n".join(f"- {t}" for t in failed_tests[:50])
+        more = "" if len(failed_tests) <= 50 else f"\n… and {len(failed_tests)-50} more."
+        return f"Failed tests (final):\n{items}{more}"
+
+    # List tests that failed at least once (even if they passed finally)
+    if re.search(r"\b(list|show|which)\b.*\b(failed at least once|failed on retry|failed during retry|failed once)\b", msg):
+        # Optionally exclude the *final* failures if you only want “recovered” ones:
+        # recovered = [t for t in failed_once_names if t not in failed_tests]
+        recovered = failed_once_names
+        if not recovered:
+            return "No tests failed during retries; all passing tests stayed green."
+        items = "\n".join(f"- {t}" for t in recovered[:100])
+        more = "" if len(recovered) <= 100 else f"\n… and {len(recovered)-100} more."
+        return f"Tests that failed at least once:\n{items}{more}"
+
+    # List passed tests
+    if re.search(r"\b(list|show|which)\b.*\b(passed tests|tests that passed)\b", msg):
+        if not passed_tests:
+            return "No passed tests."
+        items = "\n".join(f"- {t}" for t in passed_tests[:50])
+        more = "" if len(passed_tests) <= 50 else f"\n… and {len(passed_tests)-50} more."
+        return f"Passed tests:\n{items}{more}"
+
+    # Counts by suite
+    m = re.search(r"(how many|count|number of)\s+(tests?\s+)?(passed|failed|skipped|flaky)\s+in\s+(.+)", msg)
+    if m:
+        what = m.group(3)
+        suite_query = m.group(4).strip().strip("?")
+        candidates = [s for s in per_suite.keys() if suite_query.lower() in s.lower()]
+        if not candidates:
+            return f"I couldn't find a suite matching '{suite_query}'."
+        s = candidates[0]
+        return f"In '{s}': {per_suite[s].get(what,0)} tests {what}."
+
+    return None
+
+Message = Dict[str, str]
+
+def _append_exchange(history: Optional[List[Message]], user_msg: str, assistant_msg: str) -> List[Message]:
+    history = history or []
+    history = history + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": assistant_msg}]
+    return history
+
+def respond(user_text: str, history_msgs: Optional[List[Message]]):
+    """Gradio callback that takes user text + Chatbot messages and returns updated messages.
+
+    With Chatbot(type="messages"), `history_msgs` is a list of {role, content} dicts.
     """
-    Core responder. Keep your UI exactly as-is and just call respond(...) as before.
-    Adds:
-      - greeting replies
-      - 'last run' intent (works via regex even if you don't retrain)
-      - still supports your NB canned answers
-    """
+    text = (user_text or "").strip()
+
+    def _short_help() -> str:
+        totals, *_ = get_snapshot()
+        total = sum(totals.values())
+        lines = [
+            "Here’s the current snapshot:",
+            f"• Total: {total}",
+            f"• Passed: {totals['passed']}",
+            f"• Failed (final): {totals['failed']}",
+            f"• Skipped: {totals['skipped']}",
+            f"• Flaky: {totals['flaky']}",
+            "",
+            "Try: 'list failed tests', 'list tests that failed at least once', 'any flaky tests?', or 'how many passed in <suite>'.",
+        ]
+        return "\n".join(lines)
+
+    # 1) Too vague → quick snapshot
+    if re.fullmatch(r"(?i)(tests?|results?)\??", text):
+        updated = _append_exchange(history_msgs, user_text, _short_help())
+        return updated, gr.update(value="")
+
+    # 2) Aggregate intents
     try:
-        txt = (user_text or "").strip()
+        agg = handle_aggregate_intents(text)
+        if agg is not None:
+            updated = _append_exchange(history_msgs, user_text, agg)
+            return updated, gr.update(value="")
+    except Exception:
+        pass  # keep chat alive
 
-        # 1) Greetings
-        if is_greeting(txt):
-            return ("Hi! 👋 I’m your Playwright test helper. "
-                    "You can ask things like: 'list failed tests', 'how many passed', "
-                    "'last run test', or 'why did a test fail?'")
-
-        # 2) Try your Naive Bayes model first
-        key: Optional[str] = None
-        try:
-            vec = vectorizer.transform([txt])
-            pred = model.predict(vec)[0]
-            key = pred if isinstance(pred, str) else None
-        except Exception:
-            key = None
-
-        # 3) Regex fallback for last-run (so you don't *need* to retrain)
-        last_run_match = any(re.search(p, txt, re.I) for p in [
-            r"\blast\s+(test\s*)?run\b",
-            r"\bmost\s+recent\s+test\b",
-            r"\bwhen\s+did\s+the\s+last\s+test\s+run\b",
-            r"\blast\s+run\s+test\b",
-            r"\bprevious\s+run\b",
-        ])
-        if last_run_match or key == "last_run":
-            return get_last_run_info()
-
-        # 4) Use your canned answers (answers.pkl)
-        if key and key in answers:
-            val = answers[key]
-            if isinstance(val, str) and val.strip().upper() == "LAST_RUN_PLACEHOLDER":
-                return get_last_run_info()
-            return val
-
-        # 5) Default fallback
-        return ("I didn't catch that. Try: 'list failed tests', 'how many passed', "
-                "'last run test', 'test duration <name>', or 'why did the test fail?'.")
+    # 3) Fallback: NB model (unchanged)
+    try:
+        if model is None or vectorizer is None or answers is None:
+            raise RuntimeError("Artifacts not loaded")
+        X = vectorizer.transform([text])
+        reply: Optional[str] = None
+        if hasattr(model, "predict_proba"):
+            proba = model.predict_proba(X)[0]
+            idx = int(proba.argmax())
+            conf = float(proba[idx])
+            pred = model.classes_[idx]
+            reply = answers[pred]
+            if conf < 0.45:
+                reply = _short_help()
+        else:
+            pred = model.predict(X)[0]
+            reply = answers[pred]
     except Exception as e:
-        return f"Error: {e}\n{traceback.format_exc()}"
+        reply = f"Error answering your question:\n{e}\n\n{traceback.format_exc()}"
 
-# ---------------- Minimal optional UI (auto-enabled on HF Spaces) ----------------
+    updated = _append_exchange(history_msgs, user_text, reply)
+    return updated, gr.update(value="")
+
+def do_refresh():
+    try:
+        train_model.train_bot()
+        load_artifacts()
+        return "✅ Refreshed: model retrained from latest GitHub JSON."
+    except Exception as e:
+        return f"❌ Refresh failed: {e}"
+
+load_artifacts()
+
+with gr.Blocks(title="Playwright Test Bot") as demo:
+    gr.Markdown("# 🤖 Playwright Test Bot\nAsk about your Playwright test results.")
+    with gr.Row():
+        refresh_btn = gr.Button("🔄 Refresh from GitHub & Retrain")
+        refresh_status = gr.Markdown("")
+
+    chat = gr.Chatbot(type="messages", height=420)
+    msg = gr.Textbox(placeholder="Try: How many tests passed?")
+    send = gr.Button("Send", variant="primary")
+
+    send.click(fn=respond, inputs=[msg, chat], outputs=[chat, msg])
+    msg.submit(fn=respond, inputs=[msg, chat], outputs=[chat, msg])
+    refresh_btn.click(fn=do_refresh, outputs=refresh_status)
 
 if __name__ == "__main__":
-    load_artifacts()
-
-    if ENABLE_MINIMAL_UI:
-        import gradio as gr
-
-        with gr.Blocks(title="Playwright Test Q&A") as demo:
-            gr.Markdown("## Playwright Test Q&A")
-            chat_in = gr.Textbox(label="Ask me about the tests")
-            chat_out = gr.Textbox(label="Answer")
-            btn = gr.Button("Ask")
-
-            def _on_click(q):
-                return respond(q)
-
-            btn.click(_on_click, inputs=[chat_in], outputs=[chat_out])
-            chat_in.submit(_on_click, inputs=[chat_in], outputs=[chat_out])
-
-        # On HF, Gradio will bind to the port it detects (SPACE settings). Locally, default port.
-        demo.launch()
-    else:
-        # No UI here — this keeps your existing UI untouched (import respond() elsewhere).
-        print("Artifacts loaded. Using existing UI. (Set ENABLE_MINIMAL_UI=1 or run on HF Spaces to launch demo.)")
+    demo.launch()

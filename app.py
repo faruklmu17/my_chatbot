@@ -5,7 +5,7 @@ import joblib
 import traceback
 from typing import List, Dict, Optional, Any
 
-import train_model  # we reuse fetch_data() and iter_tests()/iter_tests_with_attempts()
+import train_model  # uses fetch_data() and iter_tests()/iter_tests_with_attempts()
 
 MODEL_PATH = "model.pkl"
 VECTORIZER_PATH = "vectorizer.pkl"
@@ -25,10 +25,29 @@ def _norm_status(s: Optional[str]) -> str:
     if not s:
         return "unknown"
     s = s.strip().lower().replace(" ", "").replace("-", "_")
-    return s if s in KNOWN else s  # keep raw if reporter uses something custom
+    return s if s in KNOWN else s
 
 def _safe(s: Optional[str], default: str) -> str:
     return (s or "").strip() or default
+
+# ---- Greeting handling ----
+GREETING_REPLY = "Hello! 👋 Hope you're doing well. How can I help you with your Playwright tests today?"
+
+def is_greeting(text: str) -> bool:
+    """
+    Detect common greetings/pleasantries (hi, hello, gm/gn, good morning/evening,
+    how are you / how r u, hey, gd evening, etc.).
+    """
+    pattern = r"""
+        (?:
+          \b(hi|hello|hey)\b
+          | \bgm\b | \bgn\b
+          | \bgd\s*(morning|afternoon|evening)\b
+          | \bgood\s*(morning|afternoon|evening|night)\b
+          | \bhow\s*(are\s*you|r\s*u)\b
+        )
+    """
+    return bool(re.search(pattern, text.lower(), flags=re.VERBOSE))
 
 # ---- Load artifacts (unchanged) ----
 def load_artifacts():
@@ -50,26 +69,22 @@ def get_snapshot():
     """
     data = train_model.fetch_data()
 
-    # Prefer richer iterator with attempts; fallback to your old one
+    # Prefer richer iterator with attempts; fallback to older one
     use_rich = hasattr(train_model, "iter_tests_with_attempts")
     tests: List[Dict[str, Any]] = []
 
     if use_rich:
-        # each t is a dict with suite/spec/title/project/attempts/final_status/is_flaky/failed_once
         tests = list(train_model.iter_tests_with_attempts(data))
     else:
-        # Backward compat using your existing tuple iterator
-        # (suite_title, spec_title, test_title, final_status, project, is_flaky)
         for suite_title, spec_title, test_title, final_status, project, is_flaky in train_model.iter_tests(data):
             tests.append({
                 "suite": suite_title,
                 "spec": spec_title,
                 "title": test_title,
                 "project": project,
-                "attempts": [{"status": _norm_status(final_status)}],  # single attempt proxy
+                "attempts": [{"status": _norm_status(final_status)}],
                 "final_status": _norm_status(final_status),
                 "is_flaky": bool(is_flaky),
-                # without attempts we can't truly know, so approximate:
                 "failed_once": _norm_status(final_status) in FAIL or bool(is_flaky),
             })
 
@@ -83,7 +98,6 @@ def get_snapshot():
         sname = _safe(t.get("suite"), "Unknown suite")
         proj = _safe(t.get("project"), "default")
 
-        # Determine final status defensively
         final_status = _norm_status(t.get("final_status"))
         if not final_status:
             attempts = t.get("attempts") or []
@@ -92,13 +106,11 @@ def get_snapshot():
         is_flaky = bool(t.get("is_flaky"))
         failed_once = bool(t.get("failed_once"))
 
-        # Tally totals/per_suite using final status (Playwright semantics)
         key = "flaky" if is_flaky else (final_status or "unknown")
         totals[key] = totals.get(key, 0) + 1
         per_suite.setdefault(sname, {"passed": 0, "failed": 0, "skipped": 0, "flaky": 0, "unknown": 0})
         per_suite[sname][key] = per_suite[sname].get(key, 0) + 1
 
-        # Named lists (keep your existing strings)
         label = f"{name} ({sname})"
         if is_flaky:
             flaky_tests.append(label)
@@ -146,8 +158,6 @@ def handle_aggregate_intents(message: str) -> Optional[str]:
 
     # List tests that failed at least once (even if they passed finally)
     if re.search(r"\b(list|show|which)\b.*\b(failed at least once|failed on retry|failed during retry|failed once)\b", msg):
-        # Optionally exclude the *final* failures if you only want “recovered” ones:
-        # recovered = [t for t in failed_once_names if t not in failed_tests]
         recovered = failed_once_names
         if not recovered:
             return "No tests failed during retries; all passing tests stayed green."
@@ -190,6 +200,11 @@ def respond(user_text: str, history_msgs: Optional[List[Message]]):
     """
     text = (user_text or "").strip()
 
+    # 0) Greetings first
+    if is_greeting(text):
+        updated = _append_exchange(history_msgs, user_text, GREETING_REPLY)
+        return updated, gr.update(value="")
+
     def _short_help() -> str:
         totals, *_ = get_snapshot()
         total = sum(totals.values())
@@ -219,7 +234,7 @@ def respond(user_text: str, history_msgs: Optional[List[Message]]):
     except Exception:
         pass  # keep chat alive
 
-    # 3) Fallback: NB model (unchanged)
+    # 3) Fallback: NB model
     try:
         if model is None or vectorizer is None or answers is None:
             raise RuntimeError("Artifacts not loaded")
@@ -259,7 +274,7 @@ with gr.Blocks(title="Playwright Test Bot") as demo:
         refresh_status = gr.Markdown("")
 
     chat = gr.Chatbot(type="messages", height=420)
-    msg = gr.Textbox(placeholder="Try: How many tests passed?")
+    msg = gr.Textbox(placeholder="Say hi or ask: How many tests passed?")
     send = gr.Button("Send", variant="primary")
 
     send.click(fn=respond, inputs=[msg, chat], outputs=[chat, msg])

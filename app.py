@@ -3,9 +3,9 @@ import re
 import gradio as gr
 import joblib
 import traceback
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
-import train_model  # we reuse fetch_data() and iter_tests()
+import train_model  # we reuse fetch_data() and iter_tests()/iter_tests_with_attempts()
 
 MODEL_PATH = "model.pkl"
 VECTORIZER_PATH = "vectorizer.pkl"
@@ -15,40 +15,109 @@ model = None
 vectorizer = None
 answers = None
 
+# ---- Normalization helpers ----
+PASS = {"passed"}
+SKIP = {"skipped"}
+FAIL = {"failed", "timedout", "timed_out", "interrupted"}
+KNOWN = PASS | SKIP | FAIL | {"unknown"}
+
+def _norm_status(s: Optional[str]) -> str:
+    if not s:
+        return "unknown"
+    s = s.strip().lower().replace(" ", "").replace("-", "_")
+    return s if s in KNOWN else s  # keep raw if reporter uses something custom
+
+def _safe(s: Optional[str], default: str) -> str:
+    return (s or "").strip() or default
+
+# ---- Load artifacts (unchanged) ----
 def load_artifacts():
     global model, vectorizer, answers
     model = joblib.load(MODEL_PATH)
     vectorizer = joblib.load(VECTORIZER_PATH)
     answers = joblib.load(ANSWERS_PATH)
 
+# ---- Snapshot that understands retries/attempts ----
 def get_snapshot():
+    """
+    Returns:
+      totals: dict
+      per_suite: dict
+      passed_tests: [str]
+      failed_tests: [str]                  # FINAL failures only
+      flaky_tests: [str]                   # failed then passed
+      failed_at_least_once_names: [str]    # failed in any attempt (incl. flaky + final fails)
+    """
     data = train_model.fetch_data()
+
+    # Prefer richer iterator with attempts; fallback to your old one
+    use_rich = hasattr(train_model, "iter_tests_with_attempts")
+    tests: List[Dict[str, Any]] = []
+
+    if use_rich:
+        # each t is a dict with suite/spec/title/project/attempts/final_status/is_flaky/failed_once
+        tests = list(train_model.iter_tests_with_attempts(data))
+    else:
+        # Backward compat using your existing tuple iterator
+        # (suite_title, spec_title, test_title, final_status, project, is_flaky)
+        for suite_title, spec_title, test_title, final_status, project, is_flaky in train_model.iter_tests(data):
+            tests.append({
+                "suite": suite_title,
+                "spec": spec_title,
+                "title": test_title,
+                "project": project,
+                "attempts": [{"status": _norm_status(final_status)}],  # single attempt proxy
+                "final_status": _norm_status(final_status),
+                "is_flaky": bool(is_flaky),
+                # without attempts we can't truly know, so approximate:
+                "failed_once": _norm_status(final_status) in FAIL or bool(is_flaky),
+            })
+
     totals = {"passed": 0, "failed": 0, "skipped": 0, "flaky": 0, "unknown": 0}
-    per_suite = {}
+    per_suite: Dict[str, Dict[str, int]] = {}
     passed_tests, failed_tests, flaky_tests = [], [], []
+    failed_at_least_once_names = []
 
-    for suite_title, spec_title, test_title, final_status, project, is_flaky in train_model.iter_tests(data):
-        name = test_title or spec_title or "Unnamed test"
-        sname = suite_title or "Unknown suite"
-        status = "flaky" if is_flaky else (final_status or "unknown").lower()
+    for t in tests:
+        name = _safe(t.get("title") or t.get("spec"), "Unnamed test")
+        sname = _safe(t.get("suite"), "Unknown suite")
+        proj = _safe(t.get("project"), "default")
 
-        totals[status] = totals.get(status, 0) + 1
+        # Determine final status defensively
+        final_status = _norm_status(t.get("final_status"))
+        if not final_status:
+            attempts = t.get("attempts") or []
+            final_status = _norm_status((attempts[-1].get("status") if attempts else None))
+
+        is_flaky = bool(t.get("is_flaky"))
+        failed_once = bool(t.get("failed_once"))
+
+        # Tally totals/per_suite using final status (Playwright semantics)
+        key = "flaky" if is_flaky else (final_status or "unknown")
+        totals[key] = totals.get(key, 0) + 1
         per_suite.setdefault(sname, {"passed": 0, "failed": 0, "skipped": 0, "flaky": 0, "unknown": 0})
-        per_suite[sname][status] = per_suite[sname].get(status, 0) + 1
+        per_suite[sname][key] = per_suite[sname].get(key, 0) + 1
 
-        if status == "passed":
-            passed_tests.append(f"{name} ({sname})")
-        elif status == "failed":
-            failed_tests.append(f"{name} ({sname})")
-        elif status == "flaky":
-            flaky_tests.append(f"{name} ({sname})")
+        # Named lists (keep your existing strings)
+        label = f"{name} ({sname})"
+        if is_flaky:
+            flaky_tests.append(label)
+        if final_status in PASS:
+            passed_tests.append(label)
+        elif final_status in FAIL:
+            failed_tests.append(label)
 
-    return totals, per_suite, passed_tests, failed_tests, flaky_tests
+        if failed_once:
+            failed_at_least_once_names.append(label)
 
+    return totals, per_suite, passed_tests, failed_tests, flaky_tests, failed_at_least_once_names
+
+# ---- Aggregate intents (extended) ----
 def handle_aggregate_intents(message: str) -> Optional[str]:
     msg = message.lower().strip()
-    totals, per_suite, passed_tests, failed_tests, flaky_tests = get_snapshot()
+    totals, per_suite, passed_tests, failed_tests, flaky_tests, failed_once_names = get_snapshot()
 
+    # Any flaky?
     if re.search(r"\b(any\s+)?flaky tests?\b|\bflaky\?\b", msg):
         if totals.get("flaky", 0) == 0:
             return "No flaky tests."
@@ -56,22 +125,37 @@ def handle_aggregate_intents(message: str) -> Optional[str]:
         more = "" if len(flaky_tests) <= 50 else f"\n… and {len(flaky_tests)-50} more."
         return f"{totals['flaky']} flaky tests:\n{items}{more}"
 
-    m = re.search(r"(how many|count|number of)\s+(tests?\s+)?(passed|failed|skipped|flaky)", msg)
+    # Counts (passed/failed/skipped/flaky)
+    m = re.search(r"(how many|count|number of)\s+(tests?\s+)?(passed|failed|skipped|flaky)\b", msg)
     if m:
         what = m.group(3)
         return f"{totals.get(what,0)} tests {what}."
 
+    # Total tests
     if re.search(r"(how many|count|number of)\s+(tests?)\b", msg):
         total = sum(totals.values())
         return f"Total tests: {total} (passed {totals['passed']}, failed {totals['failed']}, skipped {totals['skipped']}, flaky {totals['flaky']})."
 
+    # List FINAL failed tests
     if re.search(r"\b(list|show|which)\b.*\b(failed tests|tests that failed|failures)\b", msg):
         if not failed_tests:
-            return "No failed tests."
+            return "No failed tests (final results)."
         items = "\n".join(f"- {t}" for t in failed_tests[:50])
         more = "" if len(failed_tests) <= 50 else f"\n… and {len(failed_tests)-50} more."
-        return f"Failed tests:\n{items}{more}"
+        return f"Failed tests (final):\n{items}{more}"
 
+    # List tests that failed at least once (even if they passed finally)
+    if re.search(r"\b(list|show|which)\b.*\b(failed at least once|failed on retry|failed during retry|failed once)\b", msg):
+        # Optionally exclude the *final* failures if you only want “recovered” ones:
+        # recovered = [t for t in failed_once_names if t not in failed_tests]
+        recovered = failed_once_names
+        if not recovered:
+            return "No tests failed during retries; all passing tests stayed green."
+        items = "\n".join(f"- {t}" for t in recovered[:100])
+        more = "" if len(recovered) <= 100 else f"\n… and {len(recovered)-100} more."
+        return f"Tests that failed at least once:\n{items}{more}"
+
+    # List passed tests
     if re.search(r"\b(list|show|which)\b.*\b(passed tests|tests that passed)\b", msg):
         if not passed_tests:
             return "No passed tests."
@@ -79,13 +163,7 @@ def handle_aggregate_intents(message: str) -> Optional[str]:
         more = "" if len(passed_tests) <= 50 else f"\n… and {len(passed_tests)-50} more."
         return f"Passed tests:\n{items}{more}"
 
-    if re.search(r"\b(list|show|which)\b.*\b(flaky tests?)\b", msg):
-        if not flaky_tests:
-            return "No flaky tests."
-        items = "\n".join(f"- {t}" for t in flaky_tests[:50])
-        more = "" if len(flaky_tests) <= 50 else f"\n… and {len(flaky_tests)-50} more."
-        return f"Flaky tests:\n{items}{more}"
-
+    # Counts by suite
     m = re.search(r"(how many|count|number of)\s+(tests?\s+)?(passed|failed|skipped|flaky)\s+in\s+(.+)", msg)
     if m:
         what = m.group(3)
@@ -112,7 +190,6 @@ def respond(user_text: str, history_msgs: Optional[List[Message]]):
     """
     text = (user_text or "").strip()
 
-    # Helper to provide a concise snapshot/help when the query is vague
     def _short_help() -> str:
         totals, *_ = get_snapshot()
         total = sum(totals.values())
@@ -120,30 +197,29 @@ def respond(user_text: str, history_msgs: Optional[List[Message]]):
             "Here’s the current snapshot:",
             f"• Total: {total}",
             f"• Passed: {totals['passed']}",
-            f"• Failed: {totals['failed']}",
+            f"• Failed (final): {totals['failed']}",
             f"• Skipped: {totals['skipped']}",
             f"• Flaky: {totals['flaky']}",
             "",
-            "Try: 'list failed tests', 'any flaky tests?', or 'how many passed in <suite>'.",
+            "Try: 'list failed tests', 'list tests that failed at least once', 'any flaky tests?', or 'how many passed in <suite>'.",
         ]
         return "\n".join(lines)
 
-    # 1) If too vague like just 'tests' or 'results', show summary to avoid hallucinated per-test answers
+    # 1) Too vague → quick snapshot
     if re.fullmatch(r"(?i)(tests?|results?)\??", text):
         updated = _append_exchange(history_msgs, user_text, _short_help())
         return updated, gr.update(value="")
 
-    # 2) Aggregate intents (counts/lists/suites)
+    # 2) Aggregate intents
     try:
         agg = handle_aggregate_intents(text)
         if agg is not None:
             updated = _append_exchange(history_msgs, user_text, agg)
             return updated, gr.update(value="")
     except Exception:
-        # don't break chat if aggregate fails
-        pass
+        pass  # keep chat alive
 
-    # 3) Fallback: ML classifier for per-test Q&A, with a confidence guardrail
+    # 3) Fallback: NB model (unchanged)
     try:
         if model is None or vectorizer is None or answers is None:
             raise RuntimeError("Artifacts not loaded")
@@ -165,7 +241,6 @@ def respond(user_text: str, history_msgs: Optional[List[Message]]):
 
     updated = _append_exchange(history_msgs, user_text, reply)
     return updated, gr.update(value="")
-
 
 def do_refresh():
     try:

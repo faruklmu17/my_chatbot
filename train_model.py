@@ -12,11 +12,13 @@ from sklearn.feature_extraction.text import CountVectorizer
 GITHUB_JSON_URL = "https://raw.githubusercontent.com/faruklmu17/browser_extension_test/refs/heads/main/tests/test-results.json"
 
 def fetch_data() -> Dict[str, Any]:
-    """Fetches JSON data from the GitHub raw URL."""
+    """Fetch the Playwright JSON from GitHub (or your endpoint)."""
     resp = requests.get(GITHUB_JSON_URL, timeout=20)
     if resp.status_code == 200:
         return resp.json()
     raise RuntimeError(f"Failed to fetch JSON. Status code: {resp.status_code}")
+
+# ---------------- Core test iteration (kept compatible with your earlier code) ----------------
 
 def iter_tests(data) -> Iterator[Tuple[str, str, str, str, Optional[str], bool]]:
     """
@@ -40,37 +42,39 @@ def iter_tests(data) -> Iterator[Tuple[str, str, str, str, Optional[str], bool]]
             yield (suite_title, "", test.get("title", ""), final_status, project, flaky)
 
 def _final_status_project_flaky(test: Dict[str, Any]) -> Tuple[str, Optional[str], bool]:
-    """Return final status (last result), projectName, flaky."""
+    """Return final status (last retry), projectName, flaky."""
     results = test.get("results") or []
     if not results:
-        return ("unknown", test.get("projectName"), False)
+        return ("unknown", test.get("projectName"), bool(test.get("flaky")))
     last = results[-1]
     status = last.get("status", "unknown")
     flaky = bool(last.get("flaky") or test.get("flaky"))
     project = test.get("projectName") or last.get("projectName")
     return (status, project, flaky)
 
-# ---------- NEW: last-run capable iterator ----------
+# ---------------- Time parsing utilities (NEW) ----------------
 
 def _parse_ts(value: Any) -> Optional[datetime]:
     """
-    Robust timestamp parser.
-    Accepts ISO8601 strings (with/without Z), or epoch seconds/ms in int/float/str.
-    Returns timezone-aware UTC datetime.
+    Robust timestamp parser -> timezone-aware UTC datetime.
+    Accepts:
+      - ISO8601 strings, with or without Z
+      - epoch seconds or milliseconds (int/float/str)
     """
     if value is None:
         return None
-    # epoch-like (seconds or ms)
+
+    # epoch number or numeric string
     try:
-        if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip().isdigit()):
+        if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip().replace(".", "", 1).isdigit()):
             v = float(value)
-            # heuristically treat large numbers as ms
-            if v > 1e12:
+            if v > 1e12:  # likely milliseconds -> seconds
                 v /= 1000.0
             return datetime.fromtimestamp(v, tz=timezone.utc)
     except Exception:
         pass
 
+    # ISO8601
     if isinstance(value, str):
         s = value.strip()
         if s.endswith("Z"):
@@ -80,32 +84,42 @@ def _parse_ts(value: Any) -> Optional[datetime]:
             return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         except Exception:
             return None
+
     return None
 
 def _best_result_time(result: Dict[str, Any]) -> Optional[datetime]:
     """
-    Find the most reliable start time field on a single result object.
-    Common fields: startTime, startTimeEpoch, startTimeUnix, startTimeMS
+    Pick the most reliable time field from a single result object.
+    Common fields seen in the wild.
     """
-    candidates = [
-        result.get("startTime"),
-        result.get("startTimeEpoch"),
-        result.get("startTimeUnix"),
-        result.get("startTimeMs"),
-        result.get("startTimeMS"),
-        result.get("startTimeMilliseconds"),
-    ]
-    for c in candidates:
-        dt = _parse_ts(c)
+    for key in ("startTime", "startTimeEpoch", "startTimeUnix", "startTimeMs", "startTimeMS", "startTimeMilliseconds"):
+        dt = _parse_ts(result.get(key))
         if dt:
             return dt
-    # Some JSONs only have `startTime` at the test level; fallback handled by caller.
+    return None
+
+def _extract_last_attempt_time(test: Dict[str, Any]) -> Optional[datetime]:
+    """
+    For a test with retries, take the LAST result's start time.
+    If not found on results, try test-level time fields as a fallback.
+    """
+    results = test.get("results") or []
+    if results:
+        dt = _best_result_time(results[-1])
+        if dt:
+            return dt
+
+    for key in ("startTime", "startTimeEpoch", "startTimeUnix", "startTimeMs", "startTimeMS"):
+        dt = _parse_ts(test.get(key))
+        if dt:
+            return dt
+
     return None
 
 def iter_tests_with_time(data) -> Iterator[Tuple[str, str, str, str, Optional[str], bool, Optional[datetime]]]:
     """
     Yield (suite_title, spec_title, test_title, final_status, project_name, was_flaky, start_time_utc)
-    start_time_utc is the start time of the LAST RETRY (i.e., final attempt), UTC tz-aware.
+    start_time_utc is the start time of the LAST RETRY (final attempt), tz-aware UTC.
     """
     for suite in data.get("suites", []):
         suite_title = suite.get("title") or ""
@@ -114,35 +128,24 @@ def iter_tests_with_time(data) -> Iterator[Tuple[str, str, str, str, Optional[st
             spec_title = spec.get("title") or spec.get("file") or ""
             for test in spec.get("tests", []):
                 final_status, project, flaky = _final_status_project_flaky(test)
-                start_dt = _extract_last_attempt_time(test)
-                yield (suite_title, spec_title, test.get("title", ""), final_status, project, flaky, start_dt)
+                yield (
+                    suite_title,
+                    spec_title,
+                    test.get("title", ""),
+                    final_status,
+                    project,
+                    flaky,
+                    _extract_last_attempt_time(test),
+                )
         # pattern B
         for test in suite.get("tests", []):
             final_status, project, flaky = _final_status_project_flaky(test)
-            start_dt = _extract_last_attempt_time(test)
-            yield (suite_title, "", test.get("title", ""), final_status, project, flaky, start_dt)
-
-def _extract_last_attempt_time(test: Dict[str, Any]) -> Optional[datetime]:
-    """
-    For a test with retries, take the last result's start time.
-    If not found on results, try test-level fields as a fallback.
-    """
-    results = test.get("results") or []
-    if results:
-        last = results[-1]
-        dt = _best_result_time(last)
-        if dt:
-            return dt
-    # Fallback to test-level
-    test_level_candidates = [
-        test.get("startTime"),
-        test.get("startTimeEpoch"),
-        test.get("startTimeUnix"),
-        test.get("startTimeMs"),
-        test.get("startTimeMS"),
-    ]
-    for c in test_level_candidates:
-        dt = _parse_ts(c)
-        if dt:
-            return dt
-    return None
+            yield (
+                suite_title,
+                "",
+                test.get("title", ""),
+                final_status,
+                project,
+                flaky,
+                _extract_last_attempt_time(test),
+            )

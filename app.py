@@ -1,127 +1,157 @@
 # app.py
 import re
-import gradio as gr
 import joblib
 import traceback
 from typing import Optional, Dict, Any
 
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo  # Python 3.9+, converts UTC -> local tz
+from datetime import datetime
+from zoneinfo import ZoneInfo  # Python 3.9+
 
-import train_model  # reuse fetch_data(), iter_tests(), iter_tests_with_time()
-
+# Your model artifacts
 MODEL_PATH = "model.pkl"
 VECTORIZER_PATH = "vectorizer.pkl"
 ANSWERS_PATH = "answers.pkl"
 
-# Set your local timezone (user is in New York)
+# Timezone for human-friendly timestamps
 LOCAL_TZ = ZoneInfo("America/New_York")
+
+# Import your data helpers
+import train_model  # uses fetch_data(), iter_tests_with_time(), iter_tests()
+
+# If you want to quickly preview with a tiny UI, flip this to True.
+ENABLE_MINIMAL_UI = False
+
+# ---------------- Model/answers ----------------
 
 model = None
 vectorizer = None
 answers: Dict[str, str] = {}
 
 def load_artifacts():
+    """Load NB model, vectorizer, and canned answers."""
     global model, vectorizer, answers
     model = joblib.load(MODEL_PATH)
     vectorizer = joblib.load(VECTORIZER_PATH)
     answers = joblib.load(ANSWERS_PATH)
 
-# ---------- NEW: last-run extractor ----------
+# ---------------- Helpers: last-run + greetings ----------------
 
 def get_last_run_info() -> str:
-    """
-    Scan the JSON and return a friendly summary of the most recent test attempt start time.
-    """
+    """Find the most recent test attempt start time and format it nicely."""
     data = train_model.fetch_data()
-    latest_utc: Optional[datetime] = None
-    latest_test_name = None
-    latest_project = None
+    latest = None
+    sample_name = None
+    sample_project = None
 
-    for suite_title, spec_title, test_title, final_status, project, is_flaky, start_dt in train_model.iter_tests_with_time(data):
+    for _suite, _spec, test_title, _status, project, _flaky, start_dt in train_model.iter_tests_with_time(data):
         if not start_dt:
             continue
-        if (latest_utc is None) or (start_dt > latest_utc):
-            latest_utc = start_dt
-            latest_test_name = test_title
-            latest_project = project
+        if (latest is None) or (start_dt > latest):
+            latest = start_dt
+            sample_name = test_title
+            sample_project = project
 
-    if not latest_utc:
+    if not latest:
         return "I couldn't find a timestamp for the last run."
 
-    local_dt = latest_utc.astimezone(LOCAL_TZ)
+    local_dt = latest.astimezone(LOCAL_TZ)
+    # latest is tz-aware UTC datetime from iter_tests_with_time
     return (
         f"Last test attempt started on {local_dt.strftime('%Y-%m-%d %I:%M:%S %p %Z')} "
-        f"(~{latest_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC)"
-        + (f" — example test: “{latest_test_name}”" if latest_test_name else "")
-        + (f" (project: {latest_project})" if latest_project else "")
+        f"(~{latest.strftime('%Y-%m-%d %H:%M:%S')} UTC)"
+        + (f" — example test: “{sample_name}”" if sample_name else "")
+        + (f" (project: {sample_project})" if sample_project else "")
         + "."
     )
 
-# ---------- Existing helper (if you have one) ----------
-def classify_intent(user_text: str) -> Optional[str]:
-    """
-    Use the trained model to map to an answer key; fall back to pattern match
-    for 'last run' queries so you don't need to retrain immediately.
-    """
-    try:
-        vec = vectorizer.transform([user_text])
-        pred_idx = model.predict(vec)[0]
-        # If your model predicts an index and you index into answers differently, adjust as needed.
-        # Assuming model predicts an index into a list of keys or we stored mapping in answers:
-        # If you stored keys directly, you may already get a string key.
-        key = pred_idx if isinstance(pred_idx, str) else None
-    except Exception:
-        key = None
-
-    # --- Fallback keyword/regex for "last run" intent ---
-    last_run_patterns = [
-        r"\blast\s+(test\s*)?run\b",
-        r"\bmost\s+recent\s+test\b",
-        r"\bwhen\s+did\s+the\s+last\s+test\s+run\b",
-        r"\blast\s+run\s+test\b",
-        r"\bprevious\s+run\b",
+def is_greeting(text: str) -> bool:
+    """Lightweight greeting detector (hi/hello/gm/hey/how are you, etc.)."""
+    patterns = [
+        r"^\s*hi\b",
+        r"^\s*hello\b",
+        r"^\s*hey\b",
+        r"\bgood\s*(morning|afternoon|evening)\b",
+        r"\bhow\s*are\s*you\b",
+        r"\bhow\s*r\s*you\b",
+        r"\bgm\b", r"\bgn\b", r"\bge\b",
     ]
-    if any(re.search(p, user_text, flags=re.I) for p in last_run_patterns):
-        return "last_run"
+    t = (text or "").strip().lower()
+    return any(re.search(p, t, re.I) for p in patterns)
 
-    return key
+# ---------------- Intent classification + response ----------------
 
 def respond(user_text: str) -> str:
+    """
+    Core responder. Keep your UI exactly as-is and just call respond(...) as before.
+    Adds:
+      - greeting replies
+      - 'last run' intent (works via regex even if you don't retrain)
+      - still supports your NB canned answers
+    """
     try:
-        key = classify_intent(user_text)
+        txt = (user_text or "").strip()
 
-        # If your training data already includes a "last_run" key in answers.pkl,
-        # you can keep that mapping; we still answer dynamically here:
-        if key == "last_run":
+        # 1) Greetings
+        if is_greeting(txt):
+            return ("Hi! 👋 I’m your Playwright test helper. "
+                    "You can ask things like: 'list failed tests', 'how many passed', "
+                    "'last run test', or 'why did a test fail?'")
+
+        # 2) Try your Naive Bayes model first
+        key: Optional[str] = None
+        try:
+            vec = vectorizer.transform([txt])
+            pred = model.predict(vec)[0]
+            key = pred if isinstance(pred, str) else None
+        except Exception:
+            key = None
+
+        # 3) Regex fallback for last-run (so you don't *need* to retrain)
+        last_run_match = any(re.search(p, txt, re.I) for p in [
+            r"\blast\s+(test\s*)?run\b",
+            r"\bmost\s+recent\s+test\b",
+            r"\bwhen\s+did\s+the\s+last\s+test\s+run\b",
+            r"\blast\s+run\s+test\b",
+            r"\bprevious\s+run\b",
+        ])
+        if last_run_match or key == "last_run":
             return get_last_run_info()
 
-        # Otherwise, use the usual FAQ/intents from your Naive Bayes:
+        # 4) Use your canned answers (answers.pkl)
         if key and key in answers:
-            # If some answers are placeholders like "LAST_RUN_PLACEHOLDER", handle here:
-            if answers[key].strip().upper() == "LAST_RUN_PLACEHOLDER":
+            val = answers[key]
+            if isinstance(val, str) and val.strip().upper() == "LAST_RUN_PLACEHOLDER":
                 return get_last_run_info()
-            return answers[key]
+            return val
 
-        # If nothing matched, you can provide a safe default or echo:
-        return "I didn't catch that. Try asking things like: 'list failed tests', 'last run test', or 'how many passed?'"
-
+        # 5) Default fallback
+        return ("I didn't catch that. Try: 'list failed tests', 'how many passed', "
+                "'last run test', 'test duration <name>', or 'why did the test fail?'.")
     except Exception as e:
         return f"Error: {e}\n{traceback.format_exc()}"
 
-# ---------- Gradio UI (minimal) ----------
-with gr.Blocks(title="Playwright Test Bot") as demo:
-    gr.Markdown("## Playwright Test Q&A")
-    chat_in = gr.Textbox(label="Ask me about the tests")
-    chat_out = gr.Textbox(label="Answer")
-    btn = gr.Button("Ask")
-
-    def _on_click(q):
-        return respond(q)
-
-    btn.click(_on_click, inputs=[chat_in], outputs=[chat_out])
-    chat_in.submit(_on_click, inputs=[chat_in], outputs=[chat_out])
+# ---------------- Minimal optional UI (off by default) ----------------
 
 if __name__ == "__main__":
     load_artifacts()
-    demo.launch()
+
+    if ENABLE_MINIMAL_UI:
+        import gradio as gr
+
+        with gr.Blocks(title="Playwright Test Q&A") as demo:
+            gr.Markdown("## Playwright Test Q&A")
+            chat_in = gr.Textbox(label="Ask me about the tests")
+            chat_out = gr.Textbox(label="Answer")
+            btn = gr.Button("Ask")
+
+            def _on_click(q):
+                return respond(q)
+
+            btn.click(_on_click, inputs=[chat_in], outputs=[chat_out])
+            chat_in.submit(_on_click, inputs=[chat_in], outputs=[chat_out])
+
+        demo.launch()
+    else:
+        # No UI here — this keeps your existing UI untouched.
+        # Import this module and wire `respond()` into your current Gradio layout.
+        print("Artifacts loaded. Using existing UI. (Set ENABLE_MINIMAL_UI=True to preview.)")
